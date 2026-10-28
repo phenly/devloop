@@ -1,0 +1,16 @@
+#!/bin/zsh
+# Stand-in for `claude -p`: behaves per FAKE_MODE, using the prompt's paths.
+prompt=${@[-1]}
+code=${${prompt#*The code repo is }%%. *}
+done_file=${${prompt##*write the code repo\'s HEAD hash to }%%. *}
+n=$(( $(cat .fake_count 2>/dev/null || print 0) + 1 )); print $n > .fake_count
+case $FAKE_MODE in
+  work)      # one item per call; done after FAKE_ITEMS items
+    print "item $n" >> $code/work.txt
+    git -C $code add work.txt && git -C $code commit -qm "item $n" -- work.txt
+    print "- item $n done" >> HANDOFF.md
+    (( n >= ${FAKE_ITEMS:-2} )) && git -C $code rev-parse HEAD > $done_file ;;
+  idle) ;;   # exits without doing anything
+  limit) print "You've hit your 5-hour limit"; exit 1 ;;
+esac
+exit 0

@@ -1,0 +1,116 @@
+#!/bin/zsh
+# devloop — finish a project unattended with fresh-context `claude -p` sessions.
+# Each iteration: one handoff item, test-first, check, commit, mark done, exit.
+# HANDOFF.md is the only memory between iterations; the 5h budget paces the loop.
+emulate -L zsh
+setopt pipefail
+
+usage() {
+  cat <<'EOF'
+usage: devloop --project DIR --check CMD [options]
+
+  --project DIR    where each session starts; holds HANDOFF.md (its "Next action" is the work list)
+  --code DIR       the code repo (default: DIR/CODE, else DIR); progress = its HEAD + HANDOFF.md
+  --check CMD      test command, run in the code dir; must pass before any commit and after done
+  --prompt FILE    prompt template (default: prompt-template.md beside this script)
+  --after CMD      run once after done + check pass (e.g. a smoke run). It must fail when no real
+                   work happened: a clean exit with nothing done is not evidence.
+  --state DIR      logs and the done marker (default: ~/.local/state/devloop/<project name>)
+  --max-iter N     stop after N iterations (default 40)
+  --stop-pct N     sleep while 5h usage >= N% (default 98)
+  --stall N        stop after N iterations in a row with no progress (default 3)
+
+env: DEVLOOP_CLAUDE (default: claude), DEVLOOP_BUDGET (default: ~/.claude/budget/claude-budget.json),
+     DEVLOOP_SLEEP_S (budget wait step, default 600), DEVLOOP_BACKOFF_S (after a quick failure, default 900)
+EOF
+}
+
+proj= code= check= prompt= after= state=
+max_iter=40 stop_pct=98 stall_max=3
+while (( $# )); do
+  case $1 in
+    --project) proj=$2; shift 2 ;;
+    --code) code=$2; shift 2 ;;
+    --check) check=$2; shift 2 ;;
+    --prompt) prompt=$2; shift 2 ;;
+    --after) after=$2; shift 2 ;;
+    --state) state=$2; shift 2 ;;
+    --max-iter) max_iter=$2; shift 2 ;;
+    --stop-pct) stop_pct=$2; shift 2 ;;
+    --stall) stall_max=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) print -u2 "devloop: unknown argument $1"; usage >&2; exit 64 ;;
+  esac
+done
+[[ -n $proj && -n $check ]] || { usage >&2; exit 64; }
+proj=${proj:A}
+[[ -f $proj/HANDOFF.md ]] || { print -u2 "devloop: no HANDOFF.md in $proj"; exit 66; }
+if [[ -z $code ]]; then
+  [[ -d $proj/CODE ]] && code=$proj/CODE || code=$proj
+fi
+code=${code:A}
+git -C $code rev-parse HEAD >/dev/null || { print -u2 "devloop: $code is not a git repo with a commit"; exit 66; }
+prompt=${prompt:-${0:A:h}/prompt-template.md}
+[[ -f $prompt ]] || { print -u2 "devloop: no prompt template at $prompt"; exit 66; }
+state=${state:-$HOME/.local/state/devloop/${proj:t}}
+mkdir -p $state
+CLAUDE=${DEVLOOP_CLAUDE:-claude}
+BUDGET=${DEVLOOP_BUDGET:-$HOME/.claude/budget/claude-budget.json}
+SLEEP_S=${DEVLOOP_SLEEP_S:-600}
+BACKOFF_S=${DEVLOOP_BACKOFF_S:-900}
+LOG=$state/devloop.log
+DONE=$state/DEV_DONE
+
+log() { print -r -- "$(date '+%F %T') $*" | tee -a $LOG; }
+# An unreadable budget file counts as 0%: the session itself then hits the limit and the backoff handles it.
+used_pct() {
+  python3 -c 'import json,sys;print(int(json.load(open(sys.argv[1]))["session"]["used_pct"]))' $BUDGET 2>>$LOG || print 0
+}
+wait_for_budget() {
+  local pct
+  while pct=$(used_pct); (( pct >= stop_pct )); do
+    log "budget ${pct}% >= ${stop_pct}% — sleeping ${SLEEP_S}s for the reset"
+    sleep $SLEEP_S
+  done
+}
+fingerprint() { print -r -- "$(git -C $code rev-parse HEAD) $(md5 -q $proj/HANDOFF.md)"; }
+render() {
+  local t=$(<$prompt)
+  t=${t//\{\{CODE\}\}/$code}
+  t=${t//\{\{CHECK\}\}/$check}
+  t=${t//\{\{DONE_FILE\}\}/$DONE}
+  print -r -- $t
+}
+
+cd $proj || exit 1
+log "start pid $$: project $proj, code $code, check '$check'"
+stalls=0 i=0
+while [[ ! -f $DONE ]]; do
+  (( ++i > max_iter )) && { log "STOP: $max_iter iterations without the done marker"; exit 3; }
+  wait_for_budget
+  before=$(fingerprint) t0=$SECONDS
+  log "iteration $i start; budget $(used_pct)%"
+  $CLAUDE -p --dangerously-skip-permissions "$(render)" >> $state/iter-$i.log 2>&1
+  rc=$?
+  log "iteration $i exit $rc after $(( SECONDS - t0 ))s"
+  if [[ $(fingerprint) == $before && ! -f $DONE ]]; then
+    (( ++stalls ))
+    log "no progress ($stalls in a row)"
+    (( stalls >= stall_max )) && { log "STOP: $stall_max iterations without progress"; exit 2; }
+    (( SECONDS - t0 < 120 )) && { log "quick exit — backing off ${BACKOFF_S}s"; sleep $BACKOFF_S; }
+  else
+    stalls=0
+  fi
+done
+
+log "done marker at iteration $i ($(<$DONE)); running the check"
+(cd $code && eval $check) >> $state/final-check.log 2>&1 || { log "STOP: check failed after done"; exit 4; }
+log "check passed"
+if [[ -n $after ]]; then
+  wait_for_budget
+  (cd $code && eval $after) >> $state/after.log 2>&1
+  rc=$?
+  (( rc == 0 )) || { log "STOP: after command failed (exit $rc)"; exit 5; }
+  log "after command passed"
+fi
+log "finished"
